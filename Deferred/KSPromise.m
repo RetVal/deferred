@@ -1,5 +1,6 @@
 #import "KSPromise.h"
 
+#include <pthread.h>
 
 #if OS_OBJECT_USE_OBJC_RETAIN_RELEASE == 0
 #   define KS_DISPATCH_RELEASE(q) (dispatch_release(q))
@@ -46,6 +47,7 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
 
 @interface KSPromise () <KSCancellable> {
     dispatch_semaphore_t _sem;
+    pthread_mutex_t _mutex;
 }
 
 @property (strong, nonatomic) NSMutableArray *callbacks;
@@ -70,12 +72,18 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
         self.callbacks = [NSMutableArray array];
         self.cancellables = [NSHashTable weakObjectsHashTable];
         _sem = dispatch_semaphore_create(0);
+        pthread_mutexattr_t mutexattr;
+        pthread_mutexattr_init(&mutexattr);
+        pthread_mutexattr_settype(&mutexattr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&_mutex, &mutexattr);
+        pthread_mutexattr_destroy(&mutexattr);
     }
     return self;
 }
 
 - (void)dealloc {
     KS_DISPATCH_RELEASE(_sem);
+    pthread_mutex_destroy(&_mutex);
 }
 
 + (KSPromise *)promise:(void (^)(resolveType resolve, rejectType reject))promiseCallback {
@@ -134,12 +142,17 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
 
 - (KSPromise *)then:(promiseValueCallback)fulfilledCallback
               error:(promiseErrorCallback)errorCallback {
-    if (self.cancelled) return nil;
+    pthread_mutex_lock(&_mutex);
+    if (self.cancelled) {
+        pthread_mutex_unlock(&_mutex);
+        return nil;
+    }
     if (![self completed]) {
         KSPromiseCallbacks *callbacks = [[KSPromiseCallbacks alloc] initWithFulfilledCallback:fulfilledCallback
                                                                                 errorCallback:errorCallback
                                                                                   cancellable:self];
         [self.callbacks addObject:callbacks];
+        pthread_mutex_unlock(&_mutex);
         return callbacks.childPromise;
     }
 
@@ -158,6 +171,7 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
     KSPromise *promise = [[KSPromise alloc] init];
     [promise addCancellable:self];
     [self resolvePromise:promise withValue:nextValue];
+    pthread_mutex_unlock(&_mutex);
     return promise;
 }
 
@@ -181,15 +195,19 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
 
 - (void)addCancellable:(id<KSCancellable>)cancellable
 {
+    pthread_mutex_lock(&_mutex);
     [self.cancellables addObject:cancellable];
+    pthread_mutex_unlock(&_mutex);
 }
 
 - (void)cancel {
+    pthread_mutex_lock(&_mutex);
     self.cancelled = YES;
     for (id<KSCancellable> cancellable in self.cancellables) {
         [cancellable cancel];
     }
     [self.callbacks removeAllObjects];
+    pthread_mutex_unlock(&_mutex);
 }
 
 - (id)waitForValue {
@@ -197,23 +215,31 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
 }
 
 - (id)waitForValueWithTimeout:(NSTimeInterval)timeout {
+    pthread_mutex_lock(&_mutex);
     if (![self completed]) {
         dispatch_time_t time = timeout == 0 ? DISPATCH_TIME_FOREVER : dispatch_time(DISPATCH_TIME_NOW, timeout * NSEC_PER_SEC);
         dispatch_semaphore_wait(_sem, time);
     }
     if (self.fulfilled) {
+        pthread_mutex_unlock(&_mutex);
         return self.value;
     } else if (self.rejected) {
+        pthread_mutex_unlock(&_mutex);
         return self.error;
     }
+    pthread_mutex_unlock(&_mutex);
     return [NSError errorWithDomain:@"KSPromise" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Timeout exceeded while waiting for value"}];
 }
 
 #pragma mark - Resolving and Rejecting
 
 - (void)resolveWithValue:(id)value {
+    pthread_mutex_lock(&_mutex);
     NSAssert(!self.completed, @"A fulfilled promise can not be resolved again.");
-    if (self.completed || self.cancelled) return;
+    if (self.completed || self.cancelled) {
+        pthread_mutex_unlock(&_mutex);
+        return;
+    }
     self.value = value;
     self.fulfilled = YES;
     for (KSPromiseCallbacks *callbacks in self.callbacks) {
@@ -227,11 +253,16 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
         [self resolvePromise:callbacks.childPromise withValue:nextValue];
     }
     [self finish];
+    pthread_mutex_unlock(&_mutex);
 }
 
 - (void)rejectWithError:(NSError *)error {
+    pthread_mutex_lock(&_mutex);
     NSAssert(!self.completed, @"A fulfilled promise can not be rejected again.");
-    if (self.completed || self.cancelled) return;
+    if (self.completed || self.cancelled) {
+        pthread_mutex_unlock(&_mutex);
+        return;
+    }
     self.error = error;
     self.rejected = YES;
     for (KSPromiseCallbacks *callbacks in self.callbacks) {
@@ -245,9 +276,11 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
         [self resolvePromise:callbacks.childPromise withValue:nextValue];
     }
     [self finish];
+    pthread_mutex_unlock(&_mutex);
 }
 
 - (void)resolvePromise:(KSPromise *)promise withValue:(id)value {
+    pthread_mutex_lock(&_mutex);
     if ([value isKindOfClass:[KSPromise class]]) {
         [value then:^id(id value) {
             [promise resolveWithValue:value];
@@ -261,9 +294,11 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
     } else {
         [promise resolveWithValue:value];
     }
+    pthread_mutex_unlock(&_mutex);
 }
 
 - (void)finish {
+    pthread_mutex_lock(&_mutex);
     for (KSPromiseCallbacks *callbacks in self.callbacks) {
         if (callbacks.deprecatedCompleteCallback) {
             callbacks.deprecatedCompleteCallback(self);
@@ -271,46 +306,61 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
     }
     [self.callbacks removeAllObjects];
     dispatch_semaphore_signal(_sem);
+    pthread_mutex_unlock(&_mutex);
 }
 
 - (BOOL)completed {
-    return self.fulfilled || self.rejected;
+    pthread_mutex_lock(&_mutex);
+    BOOL completed = self.fulfilled || self.rejected;
+    pthread_mutex_unlock(&_mutex);
+    return completed;
 }
 
 #pragma mark - Deprecated methods
 - (void)whenResolved:(deferredCallback)callback {
+    pthread_mutex_lock(&_mutex);
     if (self.fulfilled) {
         callback(self);
+        pthread_mutex_unlock(&_mutex);
     } else if (!self.cancelled) {
         KSPromiseCallbacks *callbacks = [[KSPromiseCallbacks alloc] init];
         callbacks.deprecatedFulfilledCallback = callback;
         [self.callbacks addObject:callbacks];
+        pthread_mutex_unlock(&_mutex);
     }
 }
 
 - (void)whenRejected:(deferredCallback)callback {
+    pthread_mutex_lock(&_mutex);
     if (self.rejected) {
         callback(self);
+        pthread_mutex_unlock(&_mutex);
     } else if (!self.cancelled) {
         KSPromiseCallbacks *callbacks = [[KSPromiseCallbacks alloc] init];
         callbacks.deprecatedErrorCallback = callback;
         [self.callbacks addObject:callbacks];
+        pthread_mutex_unlock(&_mutex);
     }
 }
 
 - (void)whenFulfilled:(deferredCallback)callback {
+    pthread_mutex_lock(&_mutex);
     if ([self completed]) {
         callback(self);
+        pthread_mutex_unlock(&_mutex);
     } else if (!self.cancelled) {
         KSPromiseCallbacks *callbacks = [[KSPromiseCallbacks alloc] init];
         callbacks.deprecatedCompleteCallback = callback;
         [self.callbacks addObject:callbacks];
+        pthread_mutex_unlock(&_mutex);
     }
 }
 
 #pragma mark - Private methods
 - (void)joinedPromiseFulfilled:(KSPromise *)promise {
+    pthread_mutex_lock(&_mutex);
     if ([self completed]) {
+        pthread_mutex_unlock(&_mutex);
         return;
     }
     
@@ -339,6 +389,7 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
             [self resolveWithValue:values];
         }
     }
+    pthread_mutex_unlock(&_mutex);
 }
 
 @end
