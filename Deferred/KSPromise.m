@@ -217,8 +217,10 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
 - (id)waitForValueWithTimeout:(NSTimeInterval)timeout {
     pthread_mutex_lock(&_mutex);
     if (![self completed]) {
+        pthread_mutex_unlock(&_mutex);
         dispatch_time_t time = timeout == 0 ? DISPATCH_TIME_FOREVER : dispatch_time(DISPATCH_TIME_NOW, timeout * NSEC_PER_SEC);
         dispatch_semaphore_wait(_sem, time);
+        pthread_mutex_lock(&_mutex);
     }
     if (self.fulfilled) {
         pthread_mutex_unlock(&_mutex);
