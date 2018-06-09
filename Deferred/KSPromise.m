@@ -59,6 +59,7 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
 @property (assign, nonatomic) BOOL fulfilled;
 @property (assign, nonatomic) BOOL rejected;
 @property (assign, nonatomic) BOOL cancelled;
+@property (assign, nonatomic) BOOL resolvedOnTheMainThread;
 
 @property (strong, nonatomic) NSHashTable *cancellables;
 
@@ -88,15 +89,15 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
 
 + (KSPromise *)promise:(void (^)(resolveType resolve, rejectType reject))promiseCallback {
     KSPromise *promise = [[KSPromise alloc] init];
-
+    
     promiseCallback(
-    ^(id value){
-        [promise resolveWithValue:value];
-    },
-    ^(NSError *error) {
-        [promise rejectWithError:error];
-    });
-
+                    ^(id value){
+                        [promise resolveWithValue:value];
+                    },
+                    ^(NSError *error) {
+                        [promise rejectWithError:error];
+                    });
+    
     return promise;
 }
 
@@ -115,7 +116,7 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
 + (KSPromise *)when:(NSArray *)promises {
     KSPromise *promise = [[KSPromise alloc] init];
     promise.parentPromises = promises;
-
+    
     if ([promise.parentPromises count] == 0) {
         [promise joinedPromiseFulfilled:nil];
     }
@@ -155,12 +156,18 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
         pthread_mutex_unlock(&_mutex);
         return callbacks.childPromise;
     }
-
-    id nextValue;
+    BOOL needResolvedOnTheMainThread = self.resolvedOnTheMainThread && ![NSThread isMainThread];
+    __block id nextValue;
     if (self.fulfilled) {
         nextValue = self.value;
         if (fulfilledCallback) {
-           nextValue = fulfilledCallback(self.value);
+            if (needResolvedOnTheMainThread) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    nextValue = fulfilledCallback(self.value);
+                });
+            } else {
+                nextValue = fulfilledCallback(self.value);
+            }
         }
     } else if (self.rejected) {
         nextValue = self.error;
@@ -169,8 +176,15 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
         }
     }
     KSPromise *promise = [[KSPromise alloc] init];
+    promise.resolvedOnTheMainThread = self.resolvedOnTheMainThread;
     [promise addCancellable:self];
-    [self resolvePromise:promise withValue:nextValue];
+    if (needResolvedOnTheMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self resolvePromise:promise withValue:nextValue];
+        });
+    } else {
+        [self resolvePromise:promise withValue:nextValue];
+    }
     pthread_mutex_unlock(&_mutex);
     return promise;
 }
@@ -204,6 +218,9 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
     pthread_mutex_lock(&_mutex);
     self.cancelled = YES;
     for (id<KSCancellable> cancellable in self.cancellables) {
+        if (cancellable == self) {
+            continue;
+        }
         [cancellable cancel];
     }
     [self.callbacks removeAllObjects];
@@ -235,6 +252,12 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
 
 #pragma mark - Resolving and Rejecting
 
+- (void)setResolvedOnTheMainThread:(BOOL)resolvedOnTheMainThread {
+    pthread_mutex_lock(&_mutex);
+    _resolvedOnTheMainThread = resolvedOnTheMainThread;
+    pthread_mutex_unlock(&_mutex);
+}
+
 - (void)resolveWithValue:(id)value {
     pthread_mutex_lock(&_mutex);
     NSAssert(!self.completed, @"A fulfilled promise can not be resolved again.");
@@ -242,6 +265,7 @@ NSString *const KSPromiseWhenErrorValuesKey = @"KSPromiseWhenErrorValuesKey";
         pthread_mutex_unlock(&_mutex);
         return;
     }
+    self.resolvedOnTheMainThread = [NSThread isMainThread];
     self.value = value;
     self.fulfilled = YES;
     for (KSPromiseCallbacks *callbacks in self.callbacks) {
